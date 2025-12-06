@@ -4,15 +4,15 @@
 # with changed dependencies, then return as a JSON list
 
 import argparse
+import fnmatch
 import json
 import logging
 import os
-import yaml
-import logging
-
 from enum import Enum
-from git import Repo
 from pathlib import Path
+
+import yaml
+from git import Repo
 
 
 class TestTargetType(Enum):
@@ -38,6 +38,7 @@ class NextflowFile:
 
     def __init__(self, path):
         self.path = path
+        logging.debug(f"Reading {self.path}")
         self.lines = self.read_nf_file()
         self.includes = self.find_include_statements()
 
@@ -61,6 +62,21 @@ class NextflowFile:
         result = []
         for line in self.lines:
             if "include {" in line:
+                # Handle multi-line include statements
+                if "{" in line and "}" not in line:
+                    # Keep reading lines until we find the closing brace
+                    full_include = line
+                    line_idx = self.lines.index(line) + 1
+                    while (
+                        line_idx < len(self.lines) and "}" not in self.lines[line_idx]
+                    ):
+                        full_include += self.lines[line_idx]
+                        line_idx += 1
+                    if line_idx < len(self.lines):
+                        full_include += self.lines[line_idx]
+                    line = full_include
+
+                # Extract the 'from' part which contains the path
                 dependency = line.split()[2].strip("'\"").replace("/", "_").casefold()
                 result.append(dependency)
         return result
@@ -82,6 +98,7 @@ class NfTest:
         nextflow (NextflowFile): The NextflowFile object representing the Nextflow script.
         root_path (Path): The common path between the Nextflow script and the test file.
         dependencies (list[str]): The dependencies of the test.
+        tags (list[str]): The tags of the test.
     """
 
     def __init__(self, path, repo: Path = Path(".")):
@@ -106,6 +123,7 @@ class NfTest:
         self.nextflow = NextflowFile(self.nextflow_path)
         self.root_path = self.find_common_path()
         self.dependencies = self.nextflow.includes + self.run_statements
+        self.tags = self.find_tags()
 
     def find_script_line(self) -> Path:
         """
@@ -211,29 +229,70 @@ class NfTest:
         nf_path_dir = self.nextflow.path.parent.resolve()
         test_path_dir = self.test_path.parent.resolve()
         # Find diff between them
-        diff = nf_path_dir.relative_to(test_path_dir, walk_up=True)
+        try:
+            diff = nf_path_dir.relative_to(test_path_dir)
+        except ValueError:
+            diff = nf_path_dir
         # Return common path
         return test_path_dir.joinpath(diff).resolve()
+
+    def find_tags(self) -> list[str]:
+        """
+        Find all tags in the Nextflow file.
+        """
+        result = []
+        for line in self.lines:
+            if line.strip().startswith("tag "):
+                logging.debug(f"Found tag line: {line}")
+                tag = line.strip().removeprefix("tag ").strip().strip("'\"").casefold()
+                result.append(tag)
+        logging.debug(f"Found tags: {result}")
+        return result
 
     def detect_if_path_is_in_test(self, path: Path) -> bool:
         """
         Detects if a path is in the test, i.e. the path is either the test itself, the nextflow script, the test directory, or the config file.
 
         Args:
-            path (Path): The path to detect.
+            path (Path): The path to test if nf-test files match.
 
         Returns:
-            bool: True if the path is in the test, False otherwise.
+            bool: True if the path is in the test files, False otherwise.
         """
-        glob_path = self.root_path.joinpath("*")
+        glob_path = self.root_path.resolve().joinpath("*")
 
-        in_root_dir = path.match(glob_path)
+        in_root_dir = path.match(glob_path) or path.match(self.root_path.resolve())
+        if in_root_dir:
+            logging.debug(f"Found {path} in root directory of {self.root_path}")
         match_nf_file = path.match(self.nextflow.path.resolve())
+        if match_nf_file:
+            logging.debug(f"Found {path} in nextflow file {self.nextflow.path}")
         match_test_file = path.match(self.test_path.resolve())
+        if match_test_file:
+            logging.debug(f"Found {path} in test file {self.test_path}")
         match_config_file = any(
             path.match(config_file.resolve()) for config_file in self.config_files
         )
-        return any([in_root_dir, match_nf_file, match_test_file, match_config_file])
+        if match_config_file:
+            logging.debug(f"Found ${path} in config file {self.config_files}")
+
+        # On the off chance the path is a directory, we need check the files are not within the changed_file path
+        in_changed_file_path = any(
+            path in x.parents or path == x
+            for x in [self.root_path, self.nextflow.path, self.test_path]
+            + self.config_files
+        )
+        if in_changed_file_path:
+            logging.debug(f"Found ${path} in test files of {self.test_name}")
+        return any(
+            [
+                in_root_dir,
+                match_nf_file,
+                match_test_file,
+                match_config_file,
+                in_changed_file_path,
+            ]
+        )
 
     def find_matching_dependencies(self, other_nf_tests):
         """
@@ -339,6 +398,14 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="Number of parents to up to return. 0 for file, 1 for immediate dir, 2 for parent dir, etc.",
     )
+    parser.add_argument(
+        "-T",
+        "--tags",
+        type=str,
+        default="",
+        help="Tags to include.",
+    )
+    parser.add_argument("--exclude_tags", type=str, default="", help="Tags to exclude.")
     return parser.parse_args()
 
 
@@ -396,8 +463,17 @@ def find_changed_files(
     for file in diff_index:
         # Get pathlib.Path object
         filepath = Path(file.a_path)
+        logging.debug(f"File found in diff_index: {str(filepath)}")
+
         # If file does not match any in the ignore list, add containing directory to changed_files
-        if not any(filepath.match(ignored_path) for ignored_path in ignore):
+        match_against_ignored = []
+        for ignored_path in ignore:
+            is_matched = fnmatch.fnmatch(str(filepath), ignored_path)
+            logging.debug(
+                f"Checking match of {str(filepath)} against {str(ignored_path)}: {str(is_matched)}"
+            )
+            match_against_ignored.append(is_matched)
+        if not any(match_against_ignored):
             # Prepend the root of the path for better scanning
             changed_files.append(path.joinpath(filepath).resolve())
 
@@ -406,7 +482,7 @@ def find_changed_files(
 
 
 def detect_include_files(
-    changed_files: list[Path], include_files: dict[str, str]
+    changed_files: list[Path], include_files: dict[str, str], root: Path
 ) -> list[Path]:
     """
     Detects the include files based on the changed files.
@@ -414,6 +490,7 @@ def detect_include_files(
     Args:
         changed_files (list[Path]): List of paths to the changed files.
         include_files (dict[str, str]): Key-value pairs to return if a certain file has changed. If a file in a directory has changed, it points to a different directory.
+        root (Path): The root path of the repository.
 
     Returns:
         list[Path]: List of paths to representing the keys of the include_files dictionary, where a value matched a path in changed_files.
@@ -423,7 +500,7 @@ def detect_include_files(
         # If file is in the include_files, we return the key instead of the value
         for include_path, include_key in include_files.items():
             if filepath.match(include_path):
-                new_changed_files.append(Path(include_key).resolve())
+                new_changed_files.append(root.joinpath(Path(include_key)).resolve())
     return new_changed_files
 
 
@@ -466,12 +543,20 @@ def detect_files(paths: list[Path], suffix: str) -> list[Path]:
 
 
 if __name__ == "__main__":
-
     # Utility stuff
     args = parse_args()
     logging.basicConfig(level=args.log_level)
     # Argparse handling of nargs is a bit rubbish. So we do it manually here.
     args.types = args.types.split(",")
+
+    if args.tags.strip() != "":
+        args.tags = [tag.strip().casefold() for tag in args.tags.split(",")]
+
+    if args.exclude_tags.strip() != "":
+        args.exclude_tags = [
+            tag.strip().casefold() for tag in args.exclude_tags.split(",")
+        ]
+
     # Quick validation of args.types since we cant do this in argparse
     if any(
         _type not in ["function", "process", "workflow", "pipeline"]
@@ -500,7 +585,7 @@ if __name__ == "__main__":
         include_files = read_yaml_inverted(args.include)
         logging.info(f"Supplementing changed files with include files: {include_files}")
         changed_files = changed_files + detect_include_files(
-            changed_files, include_files
+            changed_files, include_files, root_path
         )
 
     logging.info("Parsing nf-test files...")
@@ -515,6 +600,7 @@ if __name__ == "__main__":
     )
     # Get intersect of changed files and Nextflow components with nf-test files
     logging.info("Finding Nextflow components which have been modified...")
+    # changed_files = [changed_files[1]]  # sneaky debugging thing do not merge
     directly_modified_nf_tests = [
         nf_test_object
         for changed_file in changed_files
@@ -550,19 +636,47 @@ if __name__ == "__main__":
     only_selected_nf_tests = [
         nf_test for nf_test in all_nf_tests if nf_test.test_type.value in args.types
     ]
+    if args.tags:
+        logging.debug(f"Filtering down to only included test tags: {args.tags}")
+        logging.debug(
+            f"Tests before the filter are: {[test.test_path for test in only_selected_nf_tests]}"
+        )
+        only_selected_nf_tests = [
+            nf_test
+            for nf_test in only_selected_nf_tests
+            if any(tag in args.tags for tag in nf_test.tags)
+        ]
+        logging.debug(
+            f"Tests after the filter are: {[test.test_path for test in only_selected_nf_tests]}"
+        )
 
+    if args.exclude_tags:
+        logging.debug(f"Excluding test tags: {args.exclude_tags}")
+        logging.debug(
+            f"Tests before the filter are: {[test.test_path for test in only_selected_nf_tests]}"
+        )
+        only_selected_nf_tests = [
+            nf_test
+            for nf_test in only_selected_nf_tests
+            if all(tag not in args.exclude_tags for tag in nf_test.tags)
+        ]
+        logging.debug(
+            f"Tests after the filter are: {[test.test_path for test in only_selected_nf_tests]}"
+        )
     # Go back n_parents directories, remove root from path and stringify
     # It's a bit much but might as well do all path manipulation in one place
     logging.info("Normalising test file paths")
-    normalised_nf_test_path = list(
-        {
-            str(
-                nf_test.get_parents(args.n_parents)
-                .resolve()
-                .relative_to(root_path.resolve())
-            )
-            for nf_test in only_selected_nf_tests
-        }
+    normalised_nf_test_path = sorted(
+        list(
+            {
+                str(
+                    nf_test.get_parents(args.n_parents)
+                    .resolve()
+                    .relative_to(root_path.resolve())
+                )
+                for nf_test in only_selected_nf_tests
+            }
+        )
     )
 
     # Print to string for outputs

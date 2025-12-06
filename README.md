@@ -23,9 +23,14 @@ steps:
 
 ### Ignoring paths
 
-You may want to ignore paths such as docs, strings etc. To do this, specify a list of strings separated by spaces. This supports globbing so use `*` to match multiple.
+You may want to ignore paths such as docs, strings etc. To do this, specify a list of strings separated by spaces. This supports globbing so use `*` to match multiple. Python [fnmatch.fnmatch](https://docs.python.org/3/library/fnmatch.html) is used for matching the ignored paths. Here are some examples:
 
-Note: specifying a filename (e.g. `main.nf`) will match all instances of `main.nf`, regardless of directory. If you wish to match a path in the root of the directory use a relative path (`./main.nf`).
+- `.git/*`: Ignore all files and directories inside the `.git` directory
+- `.gitpod.yml`: Ignore `.gitpod.yml` file in the root directory
+- `*.md`: Ignore all the Markdown files
+- `tests/local/*`: Ignore all files and directories inside the `tests/local/` directory
+
+Do not use the relative path (`./`) at the start of the glob pattern as it will nullify the glob matching.
 
 ```yaml
 steps:
@@ -87,6 +92,32 @@ steps:
     head: ${{ github.sha }}
     base: ${{ github.base_ref }}
     include: include.yaml
+```
+
+### Returning tests with specific tags
+
+You may wish to return tests with specific tags. You can do this by specifying the tags in the `tags` parameter.
+
+```yaml
+steps:
+- uses: actions/checkout@v4
+- uses: adamrtalbot/detect-nf-test
+  with:
+    head: ${{ github.sha }}
+    base: ${{ github.base_ref }}
+    tags: "gpu"
+```
+
+You may wish to exclude tests with specific tags. You can do this by specifying the tags in the `exclude_tags` parameter.
+
+```yaml
+steps:
+- uses: actions/checkout@v4
+- uses: adamrtalbot/detect-nf-test
+  with:
+  head: ${{ github.sha }}
+  base: ${{ github.base_ref }}
+  exclude_tags: "gpu"
 ```
 
 ## Outputs
